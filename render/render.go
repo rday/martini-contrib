@@ -51,54 +51,79 @@ type Render interface {
 	Error(status int)
 }
 
+type RenderConfig struct {
+	Directory string
+	Extension string
+	Layout string
+}
+
 // Renderer is a Middleware that maps a render.Render service into the Martini handler chain. Renderer will compile templates
 // globbed in the given dir. Templates must have the .tmpl extension to be compiled.
 //
 // If MARTINI_ENV is set to "" or "development" then templates will be recompiled on every request. For more performance, set the
 // MARTINI_ENV environment variable to "production"
-func Renderer(dir string) martini.Handler {
-	t := compile(dir)
+func Renderer(cfg RenderConfig) martini.Handler {
+	t := compile(cfg)
+
 	return func(res http.ResponseWriter, c martini.Context) {
 		// recompile for easy development
 		if martini.Env == martini.Dev {
-			t = compile(dir)
+			t = compile(cfg)
 		}
-		c.MapTo(&renderer{res, t}, (*Render)(nil))
+		c.MapTo(&renderer{res, cfg, t}, (*Render)(nil))
 	}
 }
 
-func compile(dir string) *template.Template {
-	t := template.New(dir)
+func compile(cfg RenderConfig) map[string]*template.Template {
+	tmplMap := make(map[string]*template.Template)
 
-	filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
-		r, err := filepath.Rel(dir, path)
+	filepath.Walk(cfg.Directory, func(path string, info os.FileInfo, err error) error {
+		r, err := filepath.Rel(cfg.Directory, path)
 		if err != nil {
 			return err
 		}
 
 		ext := filepath.Ext(r)
-		if ext == ".tmpl" {
+		name := (r[0 : len(r)-len(ext)])
+		if ext == cfg.Extension {
+			if name == cfg.Layout {
+				// We don't parse the layout file
+				return nil
+			}
+
+			t := template.New(name)
 
 			buf, err := ioutil.ReadFile(path)
 			if err != nil {
 				panic(err)
 			}
 
-			name := (r[0 : len(r)-len(ext)])
 			tmpl := t.New(filepath.ToSlash(name))
+
 			// Bomb out if parse fails. We don't want any silent server starts.
-			template.Must(tmpl.Parse(string(buf)))
+			if cfg.Layout == "" {
+				// If a layout isn't specified, parse as normal
+				template.Must(tmpl.Parse(string(buf)))
+			} else {
+				// If we do have a layout specified, include that in the parse
+				template.Must(tmpl.ParseFiles(filepath.Join(cfg.Directory, cfg.Layout + cfg.Extension), path))
+			}
+
+			// XXX In production this should only run once, but in development this is run
+			// with every request. Should we lock before adding the template to the map?
+			tmplMap[name] = t
 		}
 
 		return nil
 	})
 
-	return t
+	return tmplMap
 }
 
 type renderer struct {
 	http.ResponseWriter
-	t *template.Template
+	cfg RenderConfig
+	t map[string]*template.Template
 }
 
 func (r *renderer) JSON(status int, v interface{}) {
@@ -116,7 +141,17 @@ func (r *renderer) JSON(status int, v interface{}) {
 
 func (r *renderer) HTML(status int, name string, binding interface{}) {
 	var buf bytes.Buffer
-	if err := r.t.ExecuteTemplate(&buf, name, binding); err != nil {
+	var tmpl string
+
+	// If a layout is being used, we want to execute the layout template
+	// which will pull in the other templates compiled into this object
+	if r.cfg.Layout != "" {
+		tmpl = r.cfg.Layout
+	} else {
+		tmpl = name
+	}
+
+	if err := r.t[name].ExecuteTemplate(&buf, tmpl, binding); err != nil {
 		http.Error(r, err.Error(), 500)
 		return
 	}
